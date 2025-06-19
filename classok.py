@@ -1,5 +1,16 @@
+"""
+Képfelirat generálás és beágyazás elemzés modul.
+
+Ez a modul képes:
+1. Képek felirat generálására neurális háló segítségével
+2. Képek és feliratok beágyazásainak kinyerésére
+3. Beágyazások vizualizációjára és elemzésére
+4. Hasonlósági elemzés végzésére képek és feliratok között
+"""
+
 import os
 import json
+import re
 from PIL import Image
 from tqdm import tqdm
 import numpy as np
@@ -9,7 +20,11 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import normalize
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.metrics import top_k_accuracy_score
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
 import seaborn as sns
 
 try:
@@ -18,6 +33,8 @@ except ImportError:
     umap = None
 
 class ImageCaptioner:
+    """Képek felirat generálására szolgáló osztály."""
+    
     def __init__(self, 
                  model, 
                  processor, 
@@ -27,6 +44,19 @@ class ImageCaptioner:
                  prompt,
                  device="cuda",
                  dtype=None):
+        """
+        Inicializálás.
+        
+        Args:
+            model: A felirat generáló modell
+            processor: A modell processzora
+            base_folder: A képeket tartalmazó alapmappa
+            label_map: Mappa azonosítókhoz tartozó címkéket tartalmazó dictionary
+            output_json_path: Kimeneti JSON fájl elérési útja
+            prompt: Prompt sablon a felirat generáláshoz
+            device: Eszköz, ahol a modell fut ('cuda' vagy 'cpu')
+            dtype: Adattípus a modell számára
+        """
         self.model = model
         self.processor = processor
         self.base_folder = base_folder
@@ -41,7 +71,65 @@ class ImageCaptioner:
             with open(self.output_json_path, "r") as f:
                 self.results = json.load(f)
 
+    def caption_single_image(self, image_path, max_new_tokens=500):
+        """
+        Egyetlen kép felirat generálása.
+        
+        Args:
+            image_path: A kép elérési útja
+            max_new_tokens: Generálandó tokenek maximális száma
+            
+        Returns:
+            A generált felirat
+        """
+        try:
+            # Kép betöltése
+            image = Image.open(image_path).convert("RGB")
+            
+            # Mappa azonosító kinyerése a kép útvonalából
+            folder = os.path.basename(os.path.dirname(image_path))
+            
+            if folder not in self.label_map:
+                raise ValueError(f"Nincs címke a {folder} mappához a label_map-ben")
+                
+            label = self.label_map[folder]
+            prompt = self.prompt_template.format(label=label)
+
+            # Bemenetek előkészítése
+            inputs = self.processor(
+                text=prompt.strip(),
+                images=[image],
+                return_tensors="pt"
+            ).to(self.device, dtype=self.dtype)
+
+            # Felirat generálása
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                top_p=0.9,
+                temperature=0.7
+            )
+
+            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+            
+            # Eredmény mentése
+            self.results.append({
+                "image_path": image_path,
+                "folder": folder,
+                "label": label,
+                "caption": caption
+            })
+            
+            self.save_results()
+            return caption
+
+        except Exception as e:
+            print(f"Hiba a {image_path} feldolgozása közben: {e}")
+            return None
+
     def caption_images_in_folder(self, folder_range=(1, 1)):
+        """Képek felirat generálása egy mappában vagy mappatartományban."""
         for folder in sorted(os.listdir(self.base_folder)):
             if not folder.isdigit():
                 continue
@@ -51,7 +139,7 @@ class ImageCaptioner:
                 continue
 
             if folder not in self.label_map:
-                print(f"Skipping folder {folder}: no label in JSON")
+                print(f"A {folder} mappa kihagyva: nincs címke a JSON-ban")
                 continue
 
             label = self.label_map[folder]
@@ -60,15 +148,16 @@ class ImageCaptioner:
             if not os.path.isdir(folder_path):
                 continue
 
-            for image_name in tqdm(sorted(os.listdir(folder_path)), desc=f"Processing folder {folder}"):
+            for image_name in tqdm(sorted(os.listdir(folder_path)), desc=f"{folder} mappa feldolgozása"):
                 image_path = os.path.join(folder_path, image_name)
                 
                 if any(r["image_path"] == image_path for r in self.results):
-                    continue  # Already processed
+                    continue  # Már feldolgozva
 
                 self._process_image(image_path, folder, label)
 
     def _process_image(self, image_path, folder, label, max_new_tokens=500):
+        """Egy kép feldolgozása és felirat generálása."""
         try:
             image = Image.open(image_path).convert("RGB")
             prompt = self.prompt_template.format(label=label)
@@ -99,15 +188,28 @@ class ImageCaptioner:
             self.save_results()
 
         except Exception as e:
-            print(f"Error processing {image_path}: {e}")
+            print(f"Hiba a {image_path} feldolgozása közben: {e}")
 
     def save_results(self):
+        """Eredmények mentése JSON fájlba."""
         with open(self.output_json_path, "w") as f:
             json.dump(self.results, f, indent=2)
 
 
 class EmbeddingProcessor:
+    """Képek és feliratok beágyazásainak kinyerésére szolgáló osztály."""
+    
     def __init__(self, model_name, cat_to_name_path, input_json, output_json, dataset_root):
+        """
+        Inicializálás.
+        
+        Args:
+            model_name: A használandó modell neve
+            cat_to_name_path: Címkéket tartalmazó JSON fájl elérési útja
+            input_json: Bemeneti JSON fájl elérési útja
+            output_json: Kimeneti JSON fájl elérési útja
+            dataset_root: Adathalmaz gyökérkönyvtára
+        """
         self.model_name = model_name
         self.cat_to_name_path = cat_to_name_path
         self.input_json = input_json
@@ -116,17 +218,19 @@ class EmbeddingProcessor:
 
         self.processor = SiglipProcessor.from_pretrained(model_name)
         self.model = SiglipModel.from_pretrained(model_name)
-        self.model.eval().cuda()  # or .cpu()
+        self.model.eval().cuda()  # vagy .cpu()
 
         with open(cat_to_name_path, 'r') as f:
             self.cat_to_name = json.load(f)
 
     def clean_caption(self, caption):
+        """Felirat tisztítása, csak a hasznos rész kinyerése."""
         match = re.search(r'Assistant:.*', caption, re.DOTALL)
         return match.group(0).strip() if match else caption
 
     def preprocess_json(self, save_path="cleaned_file_updated.json"):
-        # Load and clean
+        """JSON adatok előfeldolgozása és tisztítása."""
+        # Adatok betöltése és tisztítása
         with open(self.input_json, 'r') as f:
             data = json.load(f)
 
@@ -143,10 +247,11 @@ class EmbeddingProcessor:
         with open(save_path, 'w') as f:
             json.dump(data, f, indent=2)
 
-        print(f"Preprocessed and saved to {save_path}")
+        print(f"Előfeldolgozva és mentve ide: {save_path}")
         return save_path
 
     def generate_embeddings(self, cleaned_json_path):
+        """Beágyazások generálása a képekhez és feliratokhoz."""
         with open(cleaned_json_path, 'r') as f:
             caption_data = json.load(f)
 
@@ -156,14 +261,14 @@ class EmbeddingProcessor:
             image_path = entry["image_path"]
             caption = entry["caption"]
             folder = entry["folder"]
-            label = self.cat_to_name.get(folder, "Unknown")
+            label = self.cat_to_name.get(folder, "Ismeretlen")
 
-            # Encode text
+            # Szöveg beágyazása
             inputs = self.processor(text=caption, return_tensors="pt", padding=True, truncation=True).to(self.model.device)
             with torch.no_grad():
                 text_emb = self.model.get_text_features(**inputs).squeeze().cpu().tolist()
 
-            # Encode image
+            # Kép beágyazása
             image = Image.open(image_path).convert("RGB")
             inputs = self.processor(images=image, return_tensors="pt").to(self.model.device)
             with torch.no_grad():
@@ -179,11 +284,19 @@ class EmbeddingProcessor:
         with open(self.output_json, 'w') as f:
             json.dump(output_data, f, indent=2)
 
-        print(f"Embeddings saved to {self.output_json}")
+        print(f"Beágyazások elmentve ide: {self.output_json}")
 
 
 class EmbeddingPlotter:
+    """Beágyazások vizualizációjára szolgáló osztály."""
+    
     def __init__(self, json_path):
+        """
+        Inicializálás.
+        
+        Args:
+            json_path: A beágyazásokat tartalmazó JSON fájl elérési útja
+        """
         self.json_path = json_path
         self.data = self._load_data()
         self.labels = [entry["label"] for entry in self.data]
@@ -191,10 +304,21 @@ class EmbeddingPlotter:
         self.image_embeddings = normalize(np.array([entry["image embedding"] for entry in self.data]))
 
     def _load_data(self):
+        """Adatok betöltése JSON fájlból."""
         with open(self.json_path, 'r') as f:
             return json.load(f)
 
     def reduce_embeddings(self, method="pca", use="combined"):
+        """
+        Beágyazások dimenzionalitásának csökkentése.
+        
+        Args:
+            method: Csökkentés módszere ('pca', 'tsne' vagy 'umap')
+            use: Milyen beágyazásokat használjon ('text', 'image' vagy 'combined')
+            
+        Returns:
+            A csökkentett dimenziójú beágyazások
+        """
         if use == "text":
             embeddings = self.text_embeddings
         elif use == "image":
@@ -202,7 +326,7 @@ class EmbeddingPlotter:
         elif use == "combined":
             embeddings = np.concatenate([self.image_embeddings, self.text_embeddings], axis=0)
         else:
-            raise ValueError("use must be 'text', 'image', or 'combined'.")
+            raise ValueError("A 'use' paraméternek 'text', 'image' vagy 'combined' kell legyen.")
 
         if method == "pca":
             reducer = PCA(n_components=2)
@@ -210,22 +334,23 @@ class EmbeddingPlotter:
             reducer = TSNE(n_components=2, perplexity=30, n_iter=3000, random_state=42)
         elif method == "umap":
             if umap is None:
-                raise ImportError("UMAP is not installed. Run `pip install umap-learn`.")
+                raise ImportError("Az UMAP nincs telepítve. Telepítsd a 'pip install umap-learn' paranccsal.")
             reducer = umap.UMAP(n_components=2, random_state=42)
         else:
-            raise ValueError("method must be 'pca', 'tsne', or 'umap'.")
+            raise ValueError("A 'method' paraméternek 'pca', 'tsne' vagy 'umap' kell legyen.")
 
         reduced = reducer.fit_transform(embeddings)
         return reduced
 
     def plot(self, method="pca", use="combined", color_by_label=True):
+        """Beágyazások ábrázolása."""
         reduced = self.reduce_embeddings(method=method, use=use)
 
         plt.figure(figsize=(12, 10))
         if use == "combined":
             length = len(self.image_embeddings)
-            plt.scatter(reduced[:length, 0], reduced[:length, 1], label="Images", alpha=0.5)
-            plt.scatter(reduced[length:, 0], reduced[length:, 1], label="Captions", alpha=0.5)
+            plt.scatter(reduced[:length, 0], reduced[:length, 1], label="Képek", alpha=0.5)
+            plt.scatter(reduced[length:, 0], reduced[length:, 1], label="Feliratok", alpha=0.5)
             plt.legend()
         elif color_by_label:
             unique_labels = sorted(set(self.labels))
@@ -240,17 +365,26 @@ class EmbeddingPlotter:
         else:
             plt.scatter(reduced[:, 0], reduced[:, 1], alpha=0.6)
 
-        plt.title(f"{method.upper()} of {use.capitalize()} Embeddings")
-        plt.xlabel("Component 1")
-        plt.ylabel("Component 2")
+        plt.title(f"{method.upper()} {use.capitalize()} beágyazások")
+        plt.xlabel("Komponens 1")
+        plt.ylabel("Komponens 2")
         plt.grid(True)
         plt.tight_layout()
         plt.show()
 
+
 class EmbeddingClassifier:
+    """Beágyazások osztályozására szolgáló osztály."""
+    
     def __init__(self, json_path, embedding_type='text embedding', model_type='logistic', test_size=0.1):
         """
-        Initialize the classifier.
+        Inicializálás.
+        
+        Args:
+            json_path: JSON fájl elérési útja
+            embedding_type: Használandó beágyazás típusa ('text embedding' vagy 'image embedding')
+            model_type: Modell típusa ('logistic', 'random_forest' vagy 'svm')
+            test_size: Teszt adathalmaz mérete
         """
         self.json_path = json_path
         self.embedding_type = embedding_type
@@ -260,9 +394,7 @@ class EmbeddingClassifier:
         self.X_train = self.X_test = self.y_train = self.y_test = None
 
     def _get_model(self):
-        """
-        Initialize the model.
-        """
+        """Modell inicializálása a megadott típus alapján."""
         if self.model_type == 'logistic':
             return LogisticRegression(max_iter=1000)
         elif self.model_type == 'random_forest':
@@ -270,12 +402,10 @@ class EmbeddingClassifier:
         elif self.model_type == 'svm':
             return SVC()
         else:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
+            raise ValueError(f"Ismeretlen modell típus: {self.model_type}")
 
     def load_data(self):
-        """
-        Load data from the JSON file.
-        """
+        """Adatok betöltése a JSON fájlból."""
         with open(self.json_path, 'r') as f:
             data = json.load(f)
 
@@ -290,31 +420,23 @@ class EmbeddingClassifier:
         self.y = np.array(labels)
 
     def split_data(self):
-        """
-        Split the data using stratified sampling.
-        """
+        """Adatok felosztása tanító és teszt halmazra."""
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
             self.X, self.y, test_size=self.test_size, stratify=self.y, random_state=42
         )
 
     def train(self):
-        """
-        Train the model.
-        """
+        """Modell tanítása."""
         self.model.fit(self.X_train, self.y_train)
 
     def evaluate(self):
-        """
-        Evaluate the model on the test set.
-        """
+        """Modell kiértékelése."""
         y_pred = self.model.predict(self.X_test)
-        print(f"\n--- Evaluation Report for {self.embedding_type} using {self.model_type} ---")
+        print(f"\n--- Kiértékelési jelentés {self.embedding_type} használatával {self.model_type} modell esetén ---")
         print(classification_report(self.y_test, y_pred))
 
     def run(self):
-        """
-        Run the full pipeline: load, split, train, evaluate.
-        """
+        """Teljes folyamat futtatása: betöltés, felosztás, tanítás, kiértékelés."""
         self.load_data()
         self.split_data()
         self.train()
@@ -322,7 +444,15 @@ class EmbeddingClassifier:
 
 
 class EmbeddingSimilarity:
+    """Képek és feliratok hasonlóságának elemzésére szolgáló osztály."""
+    
     def __init__(self, json_path):
+        """
+        Inicializálás.
+        
+        Args:
+            json_path: JSON fájl elérési útja a beágyazásokkal
+        """
         self.json_path = json_path
         self.text_embeddings = []
         self.image_embeddings = []
@@ -330,6 +460,7 @@ class EmbeddingSimilarity:
         self.image_paths = []
 
     def load_embeddings(self):
+        """Beágyazások betöltése a JSON fájlból."""
         with open(self.json_path, 'r') as f:
             data = json.load(f)
 
@@ -345,16 +476,22 @@ class EmbeddingSimilarity:
 
     def compute_similarity_and_recall(self, k=5):
         """
-        Compute cosine similarity between text and image embeddings.
-        Return Top-1 and Top-k accuracy.
+        Koszinusz hasonlóság számítása szöveg és kép beágyazások között.
+        
+        Args:
+            k: Top-k pontosság számítása
+            
+        Returns:
+            top_k_preds: Top-k előrejelzések
+            gt_indices: Valós indexek
         """
         sim_matrix = cosine_similarity(self.text_embeddings, self.image_embeddings)
 
-        # Get sorted indices of most similar images for each text
+        # Legjobban hasonló képek indexeinek meghatározása minden szöveghez
         top_k_preds = np.argsort(sim_matrix, axis=1)[:, ::-1][:, :k]
 
-        # Ground truth: correct image is at the same index
-        gt_indices = np.arange(len(self.labels))  # assuming 1-to-1 mapping
+        # Valós indexek (1-1 megfeleltetés feltételezése)
+        gt_indices = np.arange(len(self.labels))
 
         top1_correct = np.any(top_k_preds[:, :1] == gt_indices[:, None], axis=1)
         topk_correct = np.any(top_k_preds == gt_indices[:, None], axis=1)
@@ -362,37 +499,69 @@ class EmbeddingSimilarity:
         top1_acc = np.mean(top1_correct)
         topk_acc = np.mean(topk_correct)
 
-        print(f"\nTop-1 Accuracy (Recall@1): {top1_acc:.4f}")
-        print(f"Top-{k} Accuracy (Recall@{k}): {topk_acc:.4f}")
+        print(f"\nTop-1 pontosság (Recall@1): {top1_acc:.4f}")
+        print(f"Top-{k} pontosság (Recall@{k}): {topk_acc:.4f}")
 
         return top_k_preds, gt_indices
 
-    def show_examples(self, top_k_preds, num_examples=5):
+    def show_examples(self, top_k_preds, num_examples=5, labels_to_show=None, show_correct=False):
         """
-        Plot text, real image, and Top-1 retrieved image.
+        Példák megjelenítése: szöveg, valódi kép és Top-1 visszakeresett kép.
+        
+        Args:
+            top_k_preds: Top-k előrejelzések
+            num_examples: Megjelenítendő példák száma
+            labels_to_show: Csak ezeket a címkéket jelenítsd meg (None esetén mind)
+            show_correct: Helyesen visszakeresett párosítások is megjelenjenek
         """
-        for idx in range(num_examples):
+        shown = 0
+        for idx in range(len(self.labels)):
             true_idx = idx
             pred_idx = top_k_preds[idx][0]
-
+            
+            # Ha címke szűrés van és ez a címke nincs a listában, ugorjuk át
+            if labels_to_show is not None and self.labels[true_idx] not in labels_to_show:
+                continue
+                
+            # Ha nem akarunk helyes párosításokat mutatni és ez helyes, ugorjuk át
+            if not show_correct and true_idx == pred_idx:
+                continue
+                
             true_img = Image.open(self.image_paths[true_idx])
             pred_img = Image.open(self.image_paths[pred_idx])
             label = self.labels[true_idx]
 
             fig, axs = plt.subplots(1, 2, figsize=(6, 3))
             axs[0].imshow(true_img)
-            axs[0].set_title("True Image")
+            axs[0].set_title("Valódi kép")
             axs[0].axis("off")
 
             axs[1].imshow(pred_img)
-            axs[1].set_title("Top-1 Match")
+            axs[1].set_title("Top-1 találat")
             axs[1].axis("off")
 
-            plt.suptitle(f"Label: {label}", fontsize=12)
+            plt.suptitle(f"Címke: {label}", fontsize=12)
             plt.show()
+            
+            shown += 1
+            if shown >= num_examples:
+                break
 
-    def run_retrieval_evaluation(self, k=5, num_examples=5):
+    def run_retrieval_evaluation(self, k=5, num_examples=5, labels_to_show=None, show_correct=False):
+        """
+        Teljes visszakeresési kiértékelés futtatása.
+        
+        Args:
+            k: Top-k pontosság számítása
+            num_examples: Megjelenítendő példák száma
+            labels_to_show: Csak ezeket a címkéket jelenítsd meg
+            show_correct: Helyes párosítások is megjelenjenek
+        """
         self.load_embeddings()
         top_k_preds, gt = self.compute_similarity_and_recall(k=k)
-        self.show_examples(top_k_preds, num_examples=num_examples)
-
+        self.show_examples(
+            top_k_preds, 
+            num_examples=num_examples, 
+            labels_to_show=labels_to_show, 
+            show_correct=show_correct
+        )
