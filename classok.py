@@ -1,13 +1,3 @@
-"""
-Képfelirat generálás és beágyazás elemzés modul.
-
-Ez a modul képes:
-1. Képek felirat generálására neurális háló segítségével
-2. Képek és feliratok beágyazásainak kinyerésére
-3. Beágyazások vizualizációjára és elemzésére
-4. Hasonlósági elemzés végzésére képek és feliratok között
-"""
-
 import os
 import json
 import re
@@ -33,8 +23,11 @@ except ImportError:
     umap = None
 
 class ImageCaptioner:
-    """Képek felirat generálására szolgáló osztály."""
-    
+    """
+    A general-purpose class for generating captions from images using vision-language models
+    like IDEFICS, BLIP, or LLaVA.
+    """
+
     def __init__(self, 
                  model, 
                  processor, 
@@ -42,20 +35,22 @@ class ImageCaptioner:
                  label_map, 
                  output_json_path,
                  prompt,
+                 model_type="idefics",  # NEW: Switch between BLIP, LLaVA, etc.
                  device="cuda",
                  dtype=None):
         """
-        Inicializálás.
-        
+        Initialize the captioning model.
+
         Args:
-            model: A felirat generáló modell
-            processor: A modell processzora
-            base_folder: A képeket tartalmazó alapmappa
-            label_map: Mappa azonosítókhoz tartozó címkéket tartalmazó dictionary
-            output_json_path: Kimeneti JSON fájl elérési útja
-            prompt: Prompt sablon a felirat generáláshoz
-            device: Eszköz, ahol a modell fut ('cuda' vagy 'cpu')
-            dtype: Adattípus a modell számára
+            model: The vision-language model to use (HuggingFace model)
+            processor: Corresponding processor/tokenizer
+            base_folder: Base path to the image folders
+            label_map: Dict mapping folder names to flower labels
+            output_json_path: Path to save the caption output JSON
+            prompt: Prompt template (supports `{label}` formatting)
+            model_type: One of ["idefics", "blip", "llava"]
+            device: "cuda" or "cpu"
+            dtype: Torch data type (e.g., float16 for GPU acceleration)
         """
         self.model = model
         self.processor = processor
@@ -63,135 +58,129 @@ class ImageCaptioner:
         self.label_map = label_map
         self.output_json_path = output_json_path
         self.prompt_template = prompt
+        self.model_type = model_type.lower()
         self.device = device
         self.dtype = dtype
         self.results = []
 
+        # Load previous results if available
         if os.path.exists(self.output_json_path):
             with open(self.output_json_path, "r") as f:
                 self.results = json.load(f)
 
     def caption_single_image(self, image_path, max_new_tokens=500):
-        """
-        Egyetlen kép felirat generálása.
-        
-        Args:
-            image_path: A kép elérési útja
-            max_new_tokens: Generálandó tokenek maximális száma
-            
-        Returns:
-            A generált felirat
-        """
+        folder = os.path.basename(os.path.dirname(image_path))
+        if folder not in self.label_map:
+            raise ValueError(f"Label not found for folder: {folder}")
+        label = self.label_map[folder]
+        prompt = self.prompt_template.format(label=label)
+    
         try:
-            # Kép betöltése
             image = Image.open(image_path).convert("RGB")
-            
-            # Mappa azonosító kinyerése a kép útvonalából
-            folder = os.path.basename(os.path.dirname(image_path))
-            
-            if folder not in self.label_map:
-                raise ValueError(f"Nincs címke a {folder} mappához a label_map-ben")
-                
-            label = self.label_map[folder]
-            prompt = self.prompt_template.format(label=label)
-
-            # Bemenetek előkészítése
-            inputs = self.processor(
-                text=prompt.strip(),
-                images=[image],
-                return_tensors="pt"
-            ).to(self.device, dtype=self.dtype)
-
-            # Felirat generálása
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                top_p=0.9,
-                temperature=0.7
-            )
-
-            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-            
-            # Eredmény mentése
+    
+            # === LLaVA ===
+            if self.model_type == "llava":
+                inputs = self.processor(
+                    text=prompt,
+                    images=image,
+                    return_tensors="pt"
+                ).to(self.device)
+    
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=3
+                )
+                caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    
+            # === IDEFICS ===
+            elif self.model_type == "idefics":
+                inputs = self.processor(
+                    text=prompt,
+                    images=[image],
+                    return_tensors="pt"
+                ).to(self.device, dtype=self.dtype)
+    
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    top_p=0.9,
+                    temperature=0.7
+                )
+                caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    
+            # === BLIP2 ===
+            elif self.model_type == "blip2":
+                inputs = self.processor(
+                    images=image,
+                    text=prompt,
+                    return_tensors="pt"
+                ).to(self.device)
+    
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    num_beams=3
+                )
+                caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    
+            else:
+                raise ValueError(f"Unsupported model_type: {self.model_type}")
+    
             self.results.append({
                 "image_path": image_path,
                 "folder": folder,
                 "label": label,
                 "caption": caption
             })
-            
             self.save_results()
             return caption
-
+    
         except Exception as e:
-            print(f"Hiba a {image_path} feldolgozása közben: {e}")
+            print(f"Error while processing {image_path}: {e}")
             return None
 
+
+
+
+    def caption_selected_images(self, image_paths):
+        """
+        Caption only the specific images passed in as paths.
+
+        Args:
+            image_paths: List of full image paths (strings)
+        """
+        for image_path in image_paths:
+            print(f"\nCaptioning: {image_path}")
+            self.caption_single_image(image_path)
+
     def caption_images_in_folder(self, folder_range=(1, 1)):
-        """Képek felirat generálása egy mappában vagy mappatartományban."""
+        """
+        Caption all images within a folder or a range of numbered folders.
+        """
         for folder in sorted(os.listdir(self.base_folder)):
             if not folder.isdigit():
                 continue
-
             folder_num = int(folder)
             if not (folder_range[0] <= folder_num <= folder_range[1]):
                 continue
-
             if folder not in self.label_map:
-                print(f"A {folder} mappa kihagyva: nincs címke a JSON-ban")
+                print(f"Skipping {folder}: no label in label_map")
                 continue
-
-            label = self.label_map[folder]
             folder_path = os.path.join(self.base_folder, folder)
-
-            if not os.path.isdir(folder_path):
-                continue
-
-            for image_name in tqdm(sorted(os.listdir(folder_path)), desc=f"{folder} mappa feldolgozása"):
+            for image_name in tqdm(sorted(os.listdir(folder_path)), desc=f"Processing folder {folder}"):
                 image_path = os.path.join(folder_path, image_name)
-                
                 if any(r["image_path"] == image_path for r in self.results):
-                    continue  # Már feldolgozva
-
-                self._process_image(image_path, folder, label)
-
-    def _process_image(self, image_path, folder, label, max_new_tokens=500):
-        """Egy kép feldolgozása és felirat generálása."""
-        try:
-            image = Image.open(image_path).convert("RGB")
-            prompt = self.prompt_template.format(label=label)
-
-            inputs = self.processor(
-                text=prompt.strip(),
-                images=[image],
-                return_tensors="pt"
-            ).to(self.device, dtype=self.dtype)
-
-            generated_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                top_p=0.9,
-                temperature=0.7
-            )
-
-            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-
-            self.results.append({
-                "image_path": image_path,
-                "folder": folder,
-                "label": label,
-                "caption": caption
-            })
-
-            self.save_results()
-
-        except Exception as e:
-            print(f"Hiba a {image_path} feldolgozása közben: {e}")
+                    continue
+                self.caption_single_image(image_path)
 
     def save_results(self):
-        """Eredmények mentése JSON fájlba."""
+        """
+        Save all captioning results to the output JSON file.
+        """
         with open(self.output_json_path, "w") as f:
             json.dump(self.results, f, indent=2)
 
