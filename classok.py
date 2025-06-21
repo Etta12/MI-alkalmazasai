@@ -432,24 +432,21 @@ class EmbeddingClassifier:
         self.evaluate()
 
 
-class EmbeddingSimilarity:
-    """Képek és feliratok hasonlóságának elemzésére szolgáló osztály."""
-    
+class EmbeddingSimilarityEvaluator:
+    """
+    Egyesített osztály képszintű és osztályszintű hasonlóságvizsgálathoz,
+    támogatja a koszinusz és CSLS metrikákat, valamint példák megjelenítését is.
+    """
+
     def __init__(self, json_path):
-        """
-        Inicializálás.
-        
-        Args:
-            json_path: JSON fájl elérési útja a beágyazásokkal
-        """
         self.json_path = json_path
         self.text_embeddings = []
         self.image_embeddings = []
         self.labels = []
         self.image_paths = []
+        self.results = {}
 
     def load_embeddings(self):
-        """Beágyazások betöltése a JSON fájlból."""
         with open(self.json_path, 'r') as f:
             data = json.load(f)
 
@@ -457,100 +454,111 @@ class EmbeddingSimilarity:
             self.text_embeddings.append(item["text embedding"])
             self.image_embeddings.append(item["image embedding"])
             self.labels.append(item["label"])
-            self.image_paths.append(item["image path"])
+            self.image_paths.append(item.get("image path", None))  # Optional
 
         self.text_embeddings = np.array(self.text_embeddings)
         self.image_embeddings = np.array(self.image_embeddings)
         self.labels = np.array(self.labels)
 
-    def compute_similarity_and_recall(self, k=5):
-        """
-        Koszinusz hasonlóság számítása szöveg és kép beágyazások között.
-        
-        Args:
-            k: Top-k pontosság számítása
-            
-        Returns:
-            top_k_preds: Top-k előrejelzések
-            gt_indices: Valós indexek
-        """
+    def _csls_matrix(self, csls_k=10):
         sim_matrix = cosine_similarity(self.text_embeddings, self.image_embeddings)
+        text_to_img = cosine_similarity(self.text_embeddings, self.image_embeddings)
+        img_to_text = cosine_similarity(self.image_embeddings, self.text_embeddings)
 
-        # Legjobban hasonló képek indexeinek meghatározása minden szöveghez
-        top_k_preds = np.argsort(sim_matrix, axis=1)[:, ::-1][:, :k]
+        r_text = np.mean(-np.sort(-text_to_img, axis=1)[:, :csls_k], axis=1)[:, np.newaxis]
+        r_image = np.mean(-np.sort(-img_to_text, axis=1)[:, :csls_k], axis=1)[np.newaxis, :]
 
-        # Valós indexek (1-1 megfeleltetés feltételezése)
-        gt_indices = np.arange(len(self.labels))
+        csls_matrix = 2 * sim_matrix - r_text - r_image
+        return csls_matrix
 
-        top1_correct = np.any(top_k_preds[:, :1] == gt_indices[:, None], axis=1)
-        topk_correct = np.any(top_k_preds == gt_indices[:, None], axis=1)
+    def _evaluate_image_retrieval(self, sim_matrix, k=5):
+        top_k_indices = np.argsort(sim_matrix, axis=1)[:, ::-1][:, :k]
+        top1_correct = top_k_indices[:, 0] == np.arange(len(self.labels))
+        topk_correct = np.any(top_k_indices == np.arange(len(self.labels))[:, None], axis=1)
+        return top_k_indices, np.mean(top1_correct), np.mean(topk_correct)
 
-        top1_acc = np.mean(top1_correct)
-        topk_acc = np.mean(topk_correct)
+    def _evaluate_class_retrieval(self, sim_matrix, k=5):
+        top_k_indices = np.argsort(sim_matrix, axis=1)[:, ::-1][:, :k]
+        top_k_labels = self.labels[top_k_indices]
+        correct_labels = self.labels[:, None]
+        top1_correct = np.any(top_k_labels[:, :1] == correct_labels, axis=1)
+        topk_correct = np.any(top_k_labels == correct_labels, axis=1)
+        return top_k_labels, np.mean(top1_correct), np.mean(topk_correct)
 
-        print(f"\nTop-1 pontosság (Recall@1): {top1_acc:.4f}")
-        print(f"Top-{k} pontosság (Recall@{k}): {topk_acc:.4f}")
+    def evaluate_all(self, k=5):
+        cos_sim = cosine_similarity(self.text_embeddings, self.image_embeddings)
+        csls_sim = self._csls_matrix()
 
-        return top_k_preds, gt_indices
+        _, top1_cos_img, top5_cos_img = self._evaluate_image_retrieval(cos_sim, k)
+        _, top1_csls_img, top5_csls_img = self._evaluate_image_retrieval(csls_sim, k)
 
-    def show_examples(self, top_k_preds, num_examples=5, labels_to_show=None, show_correct=False):
-        """
-        Példák megjelenítése: szöveg, valódi kép és Top-1 visszakeresett kép.
-        
-        Args:
-            top_k_preds: Top-k előrejelzések
-            num_examples: Megjelenítendő példák száma
-            labels_to_show: Csak ezeket a címkéket jelenítsd meg (None esetén mind)
-            show_correct: Helyesen visszakeresett párosítások is megjelenjenek
-        """
-        shown = 0
-        for idx in range(len(self.labels)):
-            true_idx = idx
-            pred_idx = top_k_preds[idx][0]
-            
-            # Ha címke szűrés van és ez a címke nincs a listában, ugorjuk át
-            if labels_to_show is not None and self.labels[true_idx] not in labels_to_show:
-                continue
-                
-            # Ha nem akarunk helyes párosításokat mutatni és ez helyes, ugorjuk át
-            if not show_correct and true_idx == pred_idx:
-                continue
-                
-            true_img = Image.open(self.image_paths[true_idx])
-            pred_img = Image.open(self.image_paths[pred_idx])
-            label = self.labels[true_idx]
+        _, top1_cos_cls, top5_cos_cls = self._evaluate_class_retrieval(cos_sim, k)
+        _, top1_csls_cls, top5_csls_cls = self._evaluate_class_retrieval(csls_sim, k)
 
-            fig, axs = plt.subplots(1, 2, figsize=(6, 3))
-            axs[0].imshow(true_img)
-            axs[0].set_title("Valódi kép")
-            axs[0].axis("off")
+        self.results = {
+            "Captionings": os.path.basename(self.json_path),
+            "top1cosine-image": top1_cos_img,
+            "top5cosine-image": top5_cos_img,
+            "top1csls-image": top1_csls_img,
+            "top5csls-image": top5_csls_img,
+            "top1cosine-class": top1_cos_cls,
+            "top5cosine-class": top5_cos_cls,
+            "top1csls-class": top1_csls_cls,
+            "top5csls-class": top5_csls_cls
+        }
 
-            axs[1].imshow(pred_img)
-            axs[1].set_title("Top-1 találat")
-            axs[1].axis("off")
+        return self.results
 
-            plt.suptitle(f"Címke: {label}", fontsize=12)
-            plt.show()
-            
-            shown += 1
-            if shown >= num_examples:
-                break
+    def show_examples(self, sim_matrix, k=5, num_examples=5,
+                  labels_to_show=None, show_correct=False,
+                  match_on_class=False):  # <- new parameter
 
-    def run_retrieval_evaluation(self, k=5, num_examples=5, labels_to_show=None, show_correct=False):
-        """
-        Teljes visszakeresési kiértékelés futtatása.
-        
-        Args:
-            k: Top-k pontosság számítása
-            num_examples: Megjelenítendő példák száma
-            labels_to_show: Csak ezeket a címkéket jelenítsd meg
-            show_correct: Helyes párosítások is megjelenjenek
-        """
+      top_k_preds = np.argsort(sim_matrix, axis=1)[:, ::-1][:, :k]
+      shown = 0
+
+      for idx in range(len(self.labels)):
+          true_idx = idx
+          pred_idx = top_k_preds[idx][0]
+
+          if labels_to_show and self.labels[true_idx] not in labels_to_show:
+              continue
+
+          # Choose match method
+          if match_on_class:
+              is_correct = self.labels[true_idx] == self.labels[pred_idx]
+          else:
+              is_correct = true_idx == pred_idx
+
+          if not show_correct and is_correct:
+              continue
+          if show_correct and not is_correct:
+              continue
+
+          if not self.image_paths[true_idx] or not self.image_paths[pred_idx]:
+              continue
+
+          true_img = Image.open(self.image_paths[true_idx])
+          pred_img = Image.open(self.image_paths[pred_idx])
+
+          fig, axs = plt.subplots(1, 2, figsize=(6, 3))
+          axs[0].imshow(true_img)
+          axs[0].set_title("Valódi kép")
+          axs[0].axis("off")
+
+          axs[1].imshow(pred_img)
+          axs[1].set_title("Top-1 találat")
+          axs[1].axis("off")
+
+          plt.suptitle(f"Címke: {self.labels[true_idx]}", fontsize=12)
+          plt.show()
+
+          shown += 1
+          if shown >= num_examples:
+              break
+
+    def run_retrieval_evaluation(self, k=5, num_examples=5, labels_to_show=None, show_correct=False, use_csls=False):
         self.load_embeddings()
-        top_k_preds, gt = self.compute_similarity_and_recall(k=k)
-        self.show_examples(
-            top_k_preds, 
-            num_examples=num_examples, 
-            labels_to_show=labels_to_show, 
-            show_correct=show_correct
-        )
+        sim_matrix = self._csls_matrix() if use_csls else cosine_similarity(self.text_embeddings, self.image_embeddings)
+        self.show_examples(sim_matrix, k=k, num_examples=num_examples, labels_to_show=labels_to_show, show_correct=show_correct)
+
+
