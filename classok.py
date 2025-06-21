@@ -16,6 +16,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 import seaborn as sns
+from transformers import SiglipProcessor, SiglipModel
+
 
 try:
     import umap
