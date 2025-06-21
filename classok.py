@@ -17,7 +17,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 import seaborn as sns
 from transformers import SiglipProcessor, SiglipModel
-
+from torchvision.transforms import v2 as transforms_v2
 
 try:
     import umap
@@ -188,40 +188,35 @@ class ImageCaptioner:
 
 
 class EmbeddingProcessor:
-    """Képek és feliratok beágyazásainak kinyerésére szolgáló osztály."""
-    
     def __init__(self, model_name, cat_to_name_path, input_json, output_json, dataset_root):
-        """
-        Inicializálás.
-        
-        Args:
-            model_name: A használandó modell neve
-            cat_to_name_path: Címkéket tartalmazó JSON fájl elérési útja
-            input_json: Bemeneti JSON fájl elérési útja
-            output_json: Kimeneti JSON fájl elérési útja
-            dataset_root: Adathalmaz gyökérkönyvtára
-        """
         self.model_name = model_name
         self.cat_to_name_path = cat_to_name_path
         self.input_json = input_json
         self.output_json = output_json
         self.dataset_root = dataset_root
 
+        # Load processor and model
         self.processor = SiglipProcessor.from_pretrained(model_name)
         self.model = SiglipModel.from_pretrained(model_name)
-        self.model.eval().cuda()  # vagy .cpu()
+        self.model.eval().cuda()
 
+        # Load label map
         with open(cat_to_name_path, 'r') as f:
             self.cat_to_name = json.load(f)
 
+        # Define torchvision-based random resized crop
+        self.image_transform = transforms_v2.Compose([
+            transforms_v2.Resize(256, antialias=True),
+            transforms_v2.RandomResizedCrop(size=(224, 224), antialias=True),
+        ])
+
     def clean_caption(self, caption):
-        """Felirat tisztítása, csak a hasznos rész kinyerése."""
+        """Extract the useful part from the caption (usually after 'Assistant:')."""
         match = re.search(r'Assistant:.*', caption, re.DOTALL)
         return match.group(0).strip() if match else caption
 
     def preprocess_json(self, save_path="cleaned_file_updated.json"):
-        """JSON adatok előfeldolgozása és tisztítása."""
-        # Adatok betöltése és tisztítása
+        """Fix paths and clean captions in the input JSON."""
         with open(self.input_json, 'r') as f:
             data = json.load(f)
 
@@ -238,11 +233,11 @@ class EmbeddingProcessor:
         with open(save_path, 'w') as f:
             json.dump(data, f, indent=2)
 
-        print(f"Előfeldolgozva és mentve ide: {save_path}")
+        print(f"Preprocessed and saved to {save_path}")
         return save_path
 
-    def generate_embeddings(self, cleaned_json_path):
-        """Beágyazások generálása a képekhez és feliratokhoz."""
+    def generate_embeddings(self, cleaned_json_path, apply_augmentation=True):
+        """Generate and save text and image embeddings."""
         with open(cleaned_json_path, 'r') as f:
             caption_data = json.load(f)
 
@@ -252,15 +247,23 @@ class EmbeddingProcessor:
             image_path = entry["image_path"]
             caption = entry["caption"]
             folder = entry["folder"]
-            label = self.cat_to_name.get(folder, "Ismeretlen")
+            label = self.cat_to_name.get(folder, "Unknown")
 
-            # Szöveg beágyazása
-            inputs = self.processor(text=caption, return_tensors="pt", padding=True, truncation=True).to(self.model.device)
+            # Text embedding
+            inputs = self.processor(
+                text=caption,
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            ).to(self.model.device)
             with torch.no_grad():
                 text_emb = self.model.get_text_features(**inputs).squeeze().cpu().tolist()
 
-            # Kép beágyazása
+            # Image embedding with optional augmentation
             image = Image.open(image_path).convert("RGB")
+            if apply_augmentation:
+                image = self.image_transform(image)
+
             inputs = self.processor(images=image, return_tensors="pt").to(self.model.device)
             with torch.no_grad():
                 image_emb = self.model.get_image_features(**inputs).squeeze().cpu().tolist()
@@ -275,8 +278,7 @@ class EmbeddingProcessor:
         with open(self.output_json, 'w') as f:
             json.dump(output_data, f, indent=2)
 
-        print(f"Beágyazások elmentve ide: {self.output_json}")
-
+        print(f"Embeddings saved to {self.output_json}")
 
 class EmbeddingPlotter:
     """Beágyazások vizualizációjára szolgáló osztály."""
